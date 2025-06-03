@@ -1,0 +1,68 @@
+# Settings for soilmod change prediction model for OC
+
+# Input path
+inpath: 'samples/'
+
+# Output path
+outpath: 'results/Llara_OC_2018_2021_rf-gp_changemaps_30m/' 
+
+# File name with soil data and corresponding covariates
+infname: 'OC_NDVI_data_final.csv'  
+
+# File with grid coordinates and covariates (used if predict_grid_all = True): if csv columns 'x' and 'y' represent spatial coordinates in meters
+gridname: 'grid_NDVI_data_final.csv'
+
+# set project coordinate reference system
+project_crs: "EPSG:28355" 
+
+# Name of target for prediction (column name in dataframe)
+name_target: 'OC.WB'
+
+# Choose model function, currently implemented:
+#'blr': bayesian linear regression with power transformation
+#'rf': Random Forest Regression
+#'blr-gp' Gaussian Process with bayesian linear regression as mean function
+#'rf-gp' Gaussian Process with random forest regression as mean function
+model_function: 'rf-gp'
+
+### Select spacing for spatial support 
+# (needs to be <= block size, ideally should be same size as covariate grid),
+# Settings for Cube geometry that is generated (in meters)
+xyvoxsize:  30 # same as grid measurements
+zvoxsize: 0.1 # set depth resolution
+
+# Column name for x and y coordinate
+colname_xcoord: 'Easting'
+colname_ycoord: 'Northing'
+
+### Select minimum and maximum of time for training data selection 
+tmin: 2017 # start time for prediction
+tmax: 2022 # end time for prediction 
+
+# select the two years for change prediction
+list_t_pred:  [2018, 2021] 
+
+# Column name for time coordinate
+colname_tcoord: 'year'
+
+
+### Spatial options for predictions, only relevant for prediction (option 'predict_new') 
+xyblocksize: 30 # in meters
+zblocksize: 0.1
+# or time blocksize if temporal prediction
+tblocksize: 0.1
+
+### Name of covariates in soil training data (names need to match names in grid covariate file)
+name_features: [ 'DEM_30',
+ 'SlopeDeg',
+ 'rad_dose',
+ 'rad_u',
+ 'NDVI_1yr']
+
+
+
+
+
+
+
+

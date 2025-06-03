@@ -1,0 +1,21 @@
+# Settings for feature importance OC data 2018 and 2021
+
+# Input data path
+inpath: 'samples/'
+
+# File name with soil data and corresponding covariates
+infname: 'OC_NDVI_data_final.csv' 
+
+# Output results path
+outpath: 'results/Llara_OC_2018_2021_featureimportance/'
+
+# Name of prediction target variable
+name_target: 'OC.WB'  
+
+# Name or List of covariate features to be considered (column names in infname)
+name_features: [ 'DEM_30',
+ 'SlopeDeg',
+ 'rad_dose',
+ 'rad_u',
+ 'NDVI_1yr',
+ 'NDVI_3yr']

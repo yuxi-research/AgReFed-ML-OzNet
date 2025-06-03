@@ -1,0 +1,31 @@
+name: agrefed
+channels:
+- conda-forge
+dependencies:
+- python>=3.9
+- notebook
+- jupyter
+- rasterio
+- rioxarray
+- scikit-learn
+- geopandas
+- shapely
+- pyreadr
+- ipykernel
+- ipython
+- pyyaml
+- rasterstats
+- scipy
+- seaborn
+- numpy
+- matplotlib
+- numba
+- geopy
+- schema
+- termcolor
+- tqdm
+- pytest
+- setuptools
+- selectio
+- geodata-harvester
+- xgboost

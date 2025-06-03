@@ -1,0 +1,757 @@
+"""
+Probabilistic machine learning models and evaluation using Gaussian Process Priors with mean functions.
+
+Current models implemented:
+- Gaussian Process with bayesian linear regression (BLR) as mean function and sparse spatial covariance function
+- Gaussian Process with random forest (RF) regression as mean function and sparse spatial covariance function
+
+
+Core functions:
+- train baseline models (mean functions): BLR and RF
+- hyperparameter optimisation of GP model
+- n-fold cross-validation of models
+- model evaluations: RMSE, NRMSE, R2, uncertainty of predictions
+- residual plots and analysis
+- ranking of best models
+
+See documentation for more details.
+
+User settings, such as input/output paths and all other options, are set in the settings file 
+(Default filename: settings_soilmodel_xval.yaml) 
+Alternatively, the settings file can be specified as a command line argument with: 
+'-s', or '--settings' followed by PATH-TO-FILE/FILENAME.yaml 
+(e.g. python featureimportance.py -s settings_featureimportance.yaml).
+
+See README.md for more information.
+
+This package is part of the machine learning project developed for the Agricultural Research Federation (AgReFed).
+Copyright 2022 Sebastian Haan, Sydney Informatics Hub (SIH), The University of Sydney
+
+This open-source software is released under the LGPL-3.0 License.
+
+"""
+
+import numpy as np
+import pandas as pd
+import os
+import sys
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split 
+import yaml
+import argparse
+from types import SimpleNamespace  
+
+# Custom local libraries:
+from utils import print2, truncate_data
+from preprocessing import gen_kfold
+import GPmodel as gp # GP model plus kernel functions and distance matrix calculation
+import model_blr as blr
+import model_rf as rf
+import model_xgb as xgb
+# import model_hgb as hgb
+# import model_ann as ann
+
+# Settings yaml file
+_fname_settings = 'settings_soilmod_xval.yaml'
+
+# flag to show plot figures interactively or not (True/False)
+_show = False
+
+def runmodel(dfsel, model_function, settings):
+    """
+    Train model function on dataframe dfsel and return nfold cross-validation results.
+    This function creates multiple diagnostic charts and evaluation statistics saved in the output folder.
+
+    Input:
+    ------
+    dfsel: dataframe with data for training and testing (nfold column required to split data)
+    model_function: str, function to train model (supported: 'blr', 'rf', 'blr-gp', 'rf-gp', 'gp-only')
+    settings: settings for model function
+
+    Returns:
+    --------
+    dfsum: dataframe with summary results
+    stats_summary: list of summary statistics
+    outpath: path to output files
+    """
+    outpath_root = settings.outpath
+
+    # set conditional mean function
+    # if (model_function == 'blr') | (model_function == 'rf') | (model_function == 'const'):
+    if ('-gp' in model_function) | (model_function == 'gp-only'):
+        calc_mean_only = False
+    else:
+        # only mean function model
+        calc_mean_only = True
+
+    if (model_function == 'blr-gp') | (model_function == 'blr'):
+        mean_function = 'blr'
+        # print('mean function:', mean_function)
+    if (model_function == 'rf-gp') | (model_function == 'rf'):
+        mean_function = 'rf'
+    if (model_function == 'hgb-gp') | (model_function == 'hgb'):
+        mean_function = 'hgb'
+    if (model_function == 'xgb-gp') | (model_function == 'xgb'):
+        mean_function = 'xgb'
+    if (model_function == 'ann-gp') | (model_function == 'ann'):
+        mean_function = 'ann'
+    if model_function == 'gp-only':
+        mean_function = 'const'
+        # print('mean function:', mean_function)
+    if model_function == 'const':
+        mean_function = 'const'
+        # print('mean function:', mean_function)
+    
+    # get train and test data, here we can include loop over ix for cross validation
+    range_nfold_s = np.sort(dfsel.nfold_s.unique())
+    range_nfold_t = np.sort(dfsel.nfold_t.unique())
+    
+    print(f'Computing {len(range_nfold_s)}_{len(range_nfold_t)}-fold xrossvalidation for function model: {model_function}')
+    subdir = 'Xval_' + str(len(range_nfold_s)) + '_' + str(len(range_nfold_t)) + '-fold_' + model_function + '_' + settings.name_target
+    outpath = os.path.join(outpath_root, subdir)
+
+    ### X-fold Crossvalidation ###
+    # Intialise lists to hold summary results for n-fold validation
+    mae_nflod = []
+    bias_nfold = []
+    rmse_nfold = []
+    nrmse_nfold = []
+    ubrmse_nfold = []
+    rmedse_nfold = []
+    nrmedse_nfold = []
+    meansspe_nfold = []
+    r_nfold = []
+    r2_nfold = []
+    R2_nfold = []
+    lccc_nfold = []
+    nse_nfold = []
+    gp_amplitude_nfold = []
+    gp_noise_std_nfold = []
+    gp_lengthscale_z_nfold = []
+    gp_lengthscale_xy_nfold = []
+    gp_logl_nfold = []
+    lengthscale_nfold = []
+    noise_nfold = []
+
+    #rmse_fmean_nfold = []
+    #nrmse_fmean_nfold = []
+    #rmedse_fmean_nfold = []
+    #nrmedse_fmean_nfold = []
+    histresidual = []
+    histsspe = []
+    # dataframe to hold all predictions:
+    dfpred_all = pd.DataFrame()
+
+    # Loop over all folds
+    for ix in range_nfold_s:
+        for iz in range_nfold_t:
+        # Loop over all train/test sets (test sets are designated by ix; training set is defined by the remaining set)
+            print('Processing for nfold ', ix, iz)
+
+            # update outpath with iteration of cross-validation
+            outpath_nfold = os.path.join(outpath, 'nfold_' + str(ix) + '_' + str(iz) + '/')
+            os.makedirs(outpath_nfold, exist_ok = True)
+            # Normalize all data
+
+            # split into train and test data
+            dftrain = dfsel[~((dfsel[settings.name_ixval_s]  == ix) & (dfsel[settings.name_ixval_t] == iz))].copy()
+            dftest = dfsel[(dfsel[settings.name_ixval_s]  == ix) & (dfsel[settings.name_ixval_t] == iz)].copy()
+
+            # Copy dataframe for saving results later
+            dfpred = dftest.copy() 
+
+            points3D_train = np.asarray([dftrain.z.values, dftrain.y.values, dftrain.x.values]).T
+            points3D_test = np.asarray([dftest.z.values, dftest.y.values, dftest.x.values]).T
+            # Check for nan values:
+
+            y_train = dftrain[settings.name_target].values
+            y_test = dftest[settings.name_target].values
+            # Uncertainty in coordinates
+            if 'z_diff' in list(dftrain):
+                Xdelta_train = np.asarray([0.5 * dftrain.z_diff.values, dftrain.y.values * 0, dftrain.x.values * 0.]).T
+                Xdelta_test = np.asarray([0.5 * dftest.z_diff.values, dftest.y.values * 0, dftest.x.values * 0.]).T
+            else:
+                Xdelta_train = np.asarray([0 * dftrain.z.values, dftrain.y.values * 0, dftrain.x.values * 0.]).T
+                Xdelta_test = np.asarray([0 * dftest.z.values, dftest.y.values * 0, dftest.x.values * 0.]).T
+
+
+            if mean_function == 'rf':
+                # Estimate GP mean function with Random Forest Regressor
+                X_train = dftrain[settings.name_features].values
+                y_train = dftrain[settings.name_target].values
+                X_test = dftest[settings.name_features].values
+                y_test = dftest[settings.name_target].values
+                rf_model = rf.rf_train(X_train, y_train)
+                ypred_rf_train, ynoise_train, nrmse_rf_train = rf.rf_predict(X_train, rf_model, y_test = y_train)
+                ypred_rf, ynoise_pred, nrmse_rf_test = rf.rf_predict(X_test, rf_model, y_test = y_test)
+                # Add a random noise to the mean function
+
+                y_train_fmean = ypred_rf_train
+                if not calc_mean_only:
+                    plt.figure()  # inches
+                    plt.title('Random Forest Mean Function')
+                    plt.errorbar(y_train, ypred_rf_train, ynoise_train, linestyle='None', marker = 'o', c = 'r', label = 'Train Data', alpha =0.5)
+                    plt.errorbar(y_test, ypred_rf, ynoise_pred, linestyle='None', marker = 'o', c = 'b', label = 'Test Data', alpha =0.5)
+                    plt.legend(loc = 'upper left')
+                    plt.xlabel('y True')
+                    plt.ylabel('y Predict')
+                    plt.savefig(os.path.join(outpath_nfold, settings.name_target + '_meanfunction_pred_vs_true.png'), dpi = 300)
+                    if _show:
+                        plt.show()
+                    plt.close('all')
+            elif mean_function == 'blr':
+                X_train = dftrain[settings.name_features].values
+                y_train = dftrain[settings.name_target].values
+                X_test = dftest[settings.name_features].values
+                y_test = dftest[settings.name_target].values
+                # Scale data
+                Xs_train, ys_train, scale_params = blr.scale_data(X_train, y_train)
+                scaler_x, scaler_y = scale_params
+                Xs_test = scaler_x.transform(X_test)
+                # Train BLR
+                blr_model = blr.blr_train(Xs_train, y_train)
+                # Predict for X_test
+                ypred_blr, ypred_std_blr, nrmse_blr_test = blr.blr_predict(Xs_test, blr_model, y_test = y_test)
+                ypred_blr_train,  ypred_std_blr_train, nrmse_blr_train = blr.blr_predict(Xs_train, blr_model, y_test = y_train)
+                ypred_blr = ypred_blr.flatten()
+                ypred_blr_train = ypred_blr_train.flatten()
+                y_train_fmean = ypred_blr_train
+                ynoise_train = ypred_std_blr_train #* fac_noise_train 
+                ynoise_pred = ypred_std_blr #* fac_noise_pred
+                if not calc_mean_only:
+                    plt.figure()  # inches
+                    plt.title('BLR Mean function')
+                    plt.errorbar(y_train, ypred_blr_train, ynoise_train, linestyle='None', marker = 'o', c = 'r', label = 'Train Data', alpha =0.5)
+                    plt.errorbar(y_test, ypred_blr, ynoise_pred, linestyle='None', marker = 'o', c = 'b', label = 'Test Data', alpha =0.5)
+                    plt.legend(loc = 'upper left')
+                    plt.xlabel('y True')
+                    plt.ylabel('y Predict')
+                    plt.savefig(os.path.join(outpath_nfold, settings.name_target + '_meanfunction_pred_vs_true.png'), dpi = 300)
+                    if _show:
+                        plt.show()
+                    plt.close('all')
+            elif mean_function == 'const':
+                y_train_fmean = np.mean(y_train) * np.ones(y_train.shape)
+                ypred_const = np.mean(y_train) * np.ones(y_test.shape)
+                ypred_const_train = np.mean(y_train) * y_train_fmean
+                ynoise_train = 1e-6 * np.ones(y_train.shape)
+                ynoise_pred = 1e-6 * np.ones(y_test.shape)
+            elif mean_function == 'hgb':
+                X_train = dftrain[settings.name_features].values
+                y_train = dftrain[settings.name_target].values
+                X_test = dftest[settings.name_features].values
+                y_test = dftest[settings.name_target].values
+                hgb_model = hgb.hgb_train(X_train, y_train)
+                ypred_hgb_train, ynoise_train, nrmse_hgb_train = hgb.hgb_predict(X_train, hgb_model, y_test = y_train)
+                ypred_hgb, ynoise_pred, nrmse_hgb_test = hgb.hgb_predict(X_test, hgb_model, y_test = y_test)
+                y_train_fmean = ypred_hgb_train
+            elif mean_function == 'xgb':
+                X_train = dftrain[settings.name_features].values
+                y_train = dftrain[settings.name_target].values
+                X_test = dftest[settings.name_features].values
+                y_test = dftest[settings.name_target].values
+                xgb_model = xgb.xgb_train(X_train, y_train)
+                ypred_xgb_train, ynoise_train, nrmse_xgb_train = xgb.xgb_predict(X_train, xgb_model, y_test = y_train)
+                ypred_xgb, ynoise_pred, nrmse_xgb_test = xgb.xgb_predict(X_test, xgb_model, y_test = y_test)
+                y_train_fmean = ypred_xgb_train
+            elif mean_function == 'ann':
+                X_train = dftrain[settings.name_features].values
+                y_train = dftrain[settings.name_target].values
+                X_test = dftest[settings.name_features].values
+                y_test = dftest[settings.name_target].values
+
+                from sklearn.preprocessing import StandardScaler
+                scaler = StandardScaler()
+                X_train = scaler.fit_transform(X_train)
+                X_test = scaler.transform(X_test)
+
+                ann_model = ann.ann_train(X_train, y_train)
+                ypred_ann_train, ynoise_train, nrmse_ann_train = ann.ann_predict(X_train, ann_model, y_test = y_train)
+                ypred_ann, ynoise_pred, nrmse_ann_test = ann.ann_predict(X_test, ann_model, y_test = y_test)
+                
+                y_train_fmean = ypred_ann_train
+
+            # Subtract mean function from training data for GP with zero mean
+            y_train -= y_train_fmean
+
+            # plot training and testing distribution
+            plt.figure(figsize=(8,6))
+            plt.scatter(dftrain.x.values, dftrain.y.values, alpha=0.3, c = 'b', label = 'Train') 
+            plt.scatter(dftest.x.values, dftest.y.values, alpha=0.3, c = 'r', label = 'Test')  
+            plt.axis('equal')
+            plt.xlabel('Easting')                                                                                                                                                                  
+            plt.ylabel('Northing')                                                                                                                                                                 
+            #plt.colorbar()                                                                                                                                                                         
+            plt.title('Mean subtracted ' + settings.name_target) 
+            #plt.colorbar()
+            plt.legend()
+            plt.tight_layout()                                                                                                                                                        
+            plt.savefig(os.path.join(outpath_nfold, settings.name_target + '_train.png'), dpi = 300)
+            if _show:
+                plt.show()
+
+            ### Plot histogram of target values after mean subtraction 
+            plt.clf()
+            plt.hist(y_train, bins=30)
+            plt.xlabel('Mean subtracted y_train')
+            plt.ylabel('N')
+            plt.savefig(os.path.join(outpath_nfold,'Hist_' + settings.name_target + '_train.png'), dpi = 300)
+            if _show:
+                plt.show() 
+            plt.close('all')  
+
+
+            if not calc_mean_only:
+                # optimise GP hyperparameters 
+                # Use mean of X uncertainity for optimizing since otherwise too many local minima
+                print('Mean of Y:  ' +str(np.round(np.mean(y_train),4)) + ' +/- ' + str(np.round(np.std(y_train),4))) 
+                print('Mean of Mean function:  ' +str(np.round(np.mean(y_train_fmean),4)) + ' +/- ' + str(np.round(np.std(y_train_fmean),4))) 
+                print('Mean of Mean function noise: ' +str(np.round(np.mean(ynoise_train),4)) + ' +/- ' + str(np.round(np.std(ynoise_train),4))) 
+                print('Optimizing GP hyperparameters...')
+                Xdelta_mean = Xdelta_train * 0 + np.nanmean(Xdelta_train,axis=0)
+                # TBD: find automatic way to set hyperparameter boundaries based on data
+                xymin = 0.5 * (points3D_train[:,1].max() - points3D_train[:,1].min()) / np.unique(points3D_train[:,1]).size
+                zmin = 0.5 * (points3D_train[:,0].max() - points3D_train[:,0].min()) / np.unique(points3D_train[:,0]).size
+                opt_params, opt_logl = gp.optimize_gp_3D(points3D_train, y_train, ynoise_train, xymin = xymin, zmin = zmin, Xdelta = Xdelta_mean)
+                #opt_params, opt_logl = optimize_gp_3D(points3D_train, y_train, ynoise_train, xymin = 30, zmin = 0.05, Xdelta = Xdelta_train)
+                params_gp = opt_params
+
+                # Calculate predicted mean values
+                points3D_pred = points3D_test.copy()	
+
+                print('Computing GP predictions for test set nfold ', ix)
+                ypred, ypred_std, logl, gp_train = gp.train_predict_3D(points3D_train, points3D_pred, y_train, ynoise_train, params_gp, Ynoise_pred = ynoise_pred, Xdelta = Xdelta_train)
+                ypred_train, ypred_std_train, _ , _ = gp.train_predict_3D(points3D_train, points3D_train, y_train, ynoise_train, params_gp, Ynoise_pred = ynoise_train, Xdelta = Xdelta_train)
+            else:
+                ypred = 0
+                ypred_train =0 
+                ypred_std = ynoise_pred
+                ypred_std_train = ynoise_train
+
+            # Add mean function to prediction
+            if mean_function == 'rf':
+                y_pred_zmean = ypred_rf
+                y_pred_train_zmean = ypred_rf_train
+            elif mean_function == 'blr':
+                y_pred_zmean = ypred_blr
+                y_pred_train_zmean = ypred_blr_train
+            elif mean_function == 'const':
+                y_pred_zmean = ypred_const
+                y_pred_train_zmean = ypred_const_train
+            elif mean_function == 'hgb':
+                y_pred_zmean = ypred_hgb
+                y_pred_train_zmean = ypred_hgb_train
+            elif mean_function == 'xgb':
+                y_pred_zmean = ypred_xgb
+                y_pred_train_zmean = ypred_xgb_train
+            elif mean_function == 'ann':
+                y_pred_zmean = ypred_ann
+                y_pred_train_zmean = ypred_ann_train
+
+            y_pred = ypred + y_pred_zmean
+            y_pred_train = ypred_train + y_pred_train_zmean
+            y_train += y_train_fmean
+
+            # Lin's concordance correlation coefficient
+            def lin_ccc(y_test, y_pred):
+                y_test_mean = np.nanmean(y_test)
+                y_pred_mean = np.nanmean(y_pred)
+                s_xy = np.nansum((y_test - y_test_mean) * (y_pred - y_pred_mean))
+                s_xx = np.nansum((y_test - y_test_mean) ** 2)
+                s_yy = np.nansum((y_pred - y_pred_mean) ** 2)
+                ccc = 2 * s_xy / (s_xx + s_yy + (y_test_mean - y_pred_mean) ** 2)
+                return ccc
+            lccc = lin_ccc(y_test, y_pred)
+
+            # Calculate Nash Sutcliffe Efficiency
+            nse = 1 - np.nansum((y_test - y_pred)**2) / np.nansum((y_test - np.nanmean(y_test))**2)
+
+            # Calculate Residual, RMSE, R2, SSPE
+            residual_test = y_pred - y_test
+            rmse = np.sqrt(np.nanmean(residual_test**2))
+            rmse_norm = rmse / y_test.std()
+            rmedse = np.sqrt(np.median(residual_test**2))
+            rmedse_norm = rmedse / y_test.std()
+            #sspe = residual_test**2 / ystd_test**2
+            if model_function == 'const':
+                sspe = residual_test * np.nan
+            else:
+                sspe = residual_test**2 / (ypred_std**2)
+            
+            mae = np.nanmean(np.abs(residual_test)) # Mean Absolute Error
+            bias = np.nanmean(residual_test) # Bias
+            ubrmse = np.sqrt(np.nanmean((residual_test - bias)**2)) # unbiased RMSE
+            r = np.corrcoef(y_test, y_pred)[0,1]    # Pearson r
+            r2 = r**2    # Pearson r2
+            R2 = 1 - np.nanmean(residual_test**2) / np.nanmean((y_test - y_test.mean())**2) # R2. Coefficient of Determinant. Use Pearson r2 instead
+
+            if not calc_mean_only:
+                print("GP Marginal Log-Likelihood: ", np.round(logl,2))
+            
+            # Print summary statistics
+            print("MAE: ",np.round(mae,4))
+            print("Bias: ",np.round(bias,4))
+            print("RMSE: ",np.round(rmse,4))
+            print("Normalized RMSE: ",np.round(rmse_norm,4))
+            print("Normalized ROOT MEDIAN SE: ",np.round(rmedse_norm,4))
+            print("Unbiased RMSE: ",np.round(ubrmse,4))
+            print("r: ", np.round(r,4))
+            print("r^2: ", np.round(r2,4))
+            print("R^2: ", np.round(R2,4))
+            print("Lin's CCC: ", np.round(lccc,4))
+            print("Nash Sutcliffe Efficiency: ", np.round(nse,4))
+            print("Mean Theta: ", np.round(np.mean(sspe),4))
+            print("Median Theta: ", np.round(np.median(sspe)))
+
+
+            # Save results in dataframe
+            dfpred[settings.name_target + '_predict'] = y_pred
+            dfpred[settings.name_target + '_stddev'] = ypred_std
+            dfpred['Residual'] = residual_test
+            dfpred['Residual_squared'] = residual_test**2
+            dfpred['MAE'] = mae
+            dfpred['Bias'] = bias
+            dfpred['RMSE'] = rmse
+            dfpred['nRMSE'] = rmse_norm
+            dfpred['RMEDSE'] = rmedse
+            dfpred['nRMEDSE'] = rmedse_norm
+            dfpred['ubRMSE'] = ubrmse
+            dfpred['r'] = r
+            dfpred['r2'] = r2
+            dfpred['R2'] = R2
+            dfpred['LinCCC'] = lccc
+            dfpred['NSE'] = nse
+            dfpred['Theta'] = sspe
+
+            if not calc_mean_only:
+                dfpred['amplitude'] = params_gp[0]
+                dfpred['noise_std'] = params_gp[1]
+                dfpred['lengthscale_z'] = params_gp[2]
+                dfpred['lengthscale_xy'] = params_gp[3]
+                dfpred['LogL'] = logl
+            dfpred['RMSE_norm'] = rmse_norm
+            dfpred['RMEDSE_norm'] = rmedse_norm
+            dfpred.to_csv(os.path.join(outpath_nfold, settings.name_target + '_results_nfold' + str(ix) + '.csv'), index = False)
+            # add to dataframe for all folds
+            dfpred_all = pd.concat([dfpred_all, dfpred], axis=0, ignore_index = True)
+
+            #Residual Map
+            plt.figure(figsize=(8,6))
+            plt.scatter(dftest.x.values, dftest.y.values, c=residual_test, alpha=0.3)  
+            plt.axis('equal')
+            plt.xlabel('Easting')                                                                                                                                                                  
+            plt.ylabel('Northing')                                                                                                                                                                 
+            #plt.colorbar()                                                                                                                                                                         
+            plt.title('Residual Test Data ' + settings.name_target) 
+            plt.colorbar()
+            #plt.legend()
+            plt.tight_layout()                                                                                                                                                        
+            plt.savefig(os.path.join(outpath_nfold, settings.name_target + '_residualmap.png'), dpi = 300) 
+            if _show:
+                plt.show() 
+
+            # Residual Plot
+            import seaborn as sns
+            if False:
+                plt.subplot(2, 1, 1)
+                sns.distplot(residual_test, norm_hist = True)
+                plt.title(settings.name_target + ' Residual Analysis of Test Data')
+                plt.ylabel('Residual')
+                plt.subplot(2, 1, 2)
+                sns.distplot(sspe, norm_hist = True)
+                plt.ylabel(r'$\Theta$')
+                plt.savefig(os.path.join(outpath_nfold, 'Residual_hist_' + settings.name_target + '_nfold' + str(ix) + '.png'), dpi=300)
+                if _show:
+                    plt.show() 
+                plt.close('all')
+
+
+            plt.figure() 
+            # plt.title(model_function)
+            plt.errorbar(y_train, y_pred_train, ypred_std_train, linestyle='None', marker = 'o', c = 'r', label = 'Train Data', alpha =0.5)
+            plt.errorbar(y_test, y_pred, ypred_std, linestyle='None', marker = 'o', c = 'b', label = 'Test Data', alpha =0.5)
+            plt.legend(loc = 'upper left')
+            plt.xlabel(settings.name_target + ' True')
+            plt.ylabel(settings.name_target + ' Predict')
+            plt.savefig(os.path.join(outpath_nfold, 'pred_vs_true' + settings.name_target + '_nfold' + str(ix) + '.png'), dpi = 300)
+            if _show:
+                plt.show()
+            plt.close('all')
+
+
+            mae_nflod.append(mae)
+            bias_nfold.append(bias)
+            rmse_nfold.append(rmse)
+            nrmse_nfold.append(rmse_norm)
+            rmedse_nfold.append(rmedse)
+            nrmedse_nfold.append(rmedse_norm)
+            ubrmse_nfold.append(ubrmse)
+            meansspe_nfold.append(np.mean(sspe))
+            r_nfold.append(r)
+            r2_nfold.append(r2)
+            R2_nfold.append(R2)
+            lccc_nfold.append(lccc)
+            nse_nfold.append(nse)
+
+            if not calc_mean_only:
+                gp_amplitude_nfold.append(params_gp[0])
+                gp_noise_std_nfold.append(params_gp[1])
+                gp_lengthscale_z_nfold.append(params_gp[2])
+                gp_lengthscale_xy_nfold.append(params_gp[3])
+                gp_logl_nfold.append(logl)
+            #rmse_fmean_nfold.append(rmse_fmean)
+            #nrmse_fmean_nfold.append(rmse_norm_fmean)
+            #rmedse_fmean_nfold.append(rmedse_fmean)
+            #nrmedse_fmean_nfold.append(rmedse_norm_fmean)
+            histsspe.append(sspe)
+            histresidual.append(residual_test)
+
+
+    # Save prediton results in dataframe
+    print("Saving all predictions in dataframe ...")
+    dfpred_all.to_csv(os.path.join(outpath, settings.name_target + '_results_nfold_all.csv'), index = False)
+
+    # Plot all predictions vs true for test data
+    plt.figure() 
+    plt.title('Combined Test Data')
+    plt.errorbar(dfpred_all[settings.name_target], 
+        dfpred_all[settings.name_target + '_predict'], 
+        dfpred_all[settings.name_target + '_stddev'], 
+        linestyle='None', marker = 'o', c = 'b', alpha = 0.5)
+    plt.xlabel(settings.name_target + ' True')
+    plt.ylabel(settings.name_target + ' Predict')
+    plt.savefig(os.path.join(outpath,'pred_vs_true' + settings.name_target + '_combined.png'), dpi = 300)
+    if _show:
+        plt.show()
+    plt.close('all')
+
+    # Save and plot summary results of residual analysis for test data:
+    mae_nflod = np.asarray(mae_nflod)
+    bias_nfold = np.asarray(bias_nfold)
+    rmse_nfold = np.asarray(rmse_nfold)
+    nrmse_nfold = np.asarray(nrmse_nfold)
+    rmedse_nfold = np.asarray(rmedse_nfold)
+    nrmedse_nfold = np.asarray(nrmedse_nfold)
+    ubrmse_nfold = np.asarray(ubrmse_nfold)
+    meansspe_nfold = np.asarray(meansspe_nfold)
+    r_nfold = np.asarray(r_nfold)
+    r2_nfold = np.asarray(r2_nfold)
+    R2_nfold = np.asarray(R2_nfold)
+    lccc_nfold = np.asarray(lccc_nfold)
+    nse_nfold = np.asarray(nse_nfold)
+    gp_amplitude_nfold = np.asarray(gp_amplitude_nfold)
+    gp_noise_std_nfold = np.asarray(gp_noise_std_nfold)
+    gp_lengthscale_z_nfold = np.asarray(gp_lengthscale_z_nfold)
+    gp_lengthscale_xy_nfold = np.asarray(gp_lengthscale_xy_nfold)
+    #rmse_fmean_nfold = np.asarray(rmse_fmean_nfold)
+    #nrmse_fmean_nfold = np.asarray(nrmse_fmean_nfold)
+    #rmedse_fmean_nfold = np.asarray(rmedse_fmean_nfold)
+    #nrmedse_fmean_nfold = np.asarray(nrmedse_fmean_nfold)
+    #dfsum = pd.DataFrame({'nfold': range_nfold, 'RMSE': rmse_nfold, 'nRMSE': nrmse_nfold, 'RMEDIANSE': rmedse_nfold, 'nRMEDIANSE': nrmedse_nfold, 'Theta': meansspe_nfold, 'RMSE_fmean': rmse_fmean_nfold, 'nRMSE_fmean': nrmse_fmean_nfold, 'RMEDIANSE_fmean': rmedse_fmean_nfold, 'nRMEDIANSE_fmean': nrmedse_fmean_nfold})
+
+    range_nfold = np.array(range(len(range_nfold_s) * len(range_nfold_t))) + 1
+    # Repeat each value in range_nfold_t three times consecutively
+    range_nfold_s2 = np.repeat(range_nfold_s, len(range_nfold_t))
+    # Repeat the range_nfold_s array to match the length of range_nfold_t
+    range_nfold_t2 = np.tile(range_nfold_t, len(range_nfold_s))   
+
+    # print(len(range_nfold))
+    # print(len(range_nfold_s2))
+    # print(len(range_nfold_t2))
+    # print(len(rmse_nfold))
+
+    if calc_mean_only:
+        dfsum = pd.DataFrame({'nfold': range_nfold, 'nfold_s': range_nfold_s2, 'nfold_t': range_nfold_t2, 
+                              'MAE': mae_nflod, 'Bias': bias_nfold,
+                              'RMSE': rmse_nfold, 'nRMSE': nrmse_nfold, 'ubRMSE': ubrmse_nfold,
+                              'RMEDIANSE': rmedse_nfold, 'nRMEDIANSE': nrmedse_nfold, 
+                              'r': r_nfold, 'r2': r2_nfold, 'R2': R2_nfold, 
+                              'LCCC': lccc_nfold, 'NSE': nse_nfold, 'Theta': meansspe_nfold,
+                              } )
+    else:
+        dfsum = pd.DataFrame({'nfold': range_nfold, 'nfold_s': range_nfold_s2, 'nfold_t': range_nfold_t2, 
+                              'MAE': mae_nflod, 'Bias': bias_nfold,
+                              'RMSE': rmse_nfold, 'nRMSE': nrmse_nfold, 'ubRMSE': ubrmse_nfold,
+                              'RMEDIANSE': rmedse_nfold, 'nRMEDIANSE': nrmedse_nfold, 
+                              'r': r_nfold, 'r2': r2_nfold, 'R2': R2_nfold, 
+                              'LCCC': lccc_nfold, 'NSE': nse_nfold, 'Theta': meansspe_nfold,
+                              'amplitude': gp_amplitude_nfold,
+                              'noise_std': gp_noise_std_nfold,
+                              'lengthscale_z': gp_lengthscale_z_nfold,
+                              'lengthscale_xy': gp_lengthscale_xy_nfold,
+                              'LogL': gp_logl_nfold})
+    
+    
+    dfsum.to_csv(os.path.join(outpath, settings.name_target + '_nfold_summary_stats.csv'), index = False)
+
+    print("---- X-validation Summary -----")
+    print("Mean MAE: " + str(np.round(np.mean(mae_nflod),3)) + " +/- " + str(np.round(np.std(mae_nflod),3)))
+    print("Mean Bias: " + str(np.round(np.mean(bias_nfold),3)) + " +/- " + str(np.round(np.std(bias_nfold),3)))
+    print("Mean RMSE: " + str(np.round(np.mean(rmse_nfold),3)) + " +/- " + str(np.round(np.std(rmse_nfold),3)))
+    print("Mean unbiased RMSE: " + str(np.round(np.mean(ubrmse_nfold),3)) + " +/- " + str(np.round(np.std(ubrmse_nfold),3)))
+    print("Mean normalized RMSE: " + str(np.round(np.mean(nrmse_nfold),3)) + " +/- " + str(np.round(np.std(nrmse_nfold),3)))
+    #print("Mean normalized RMSE of Meanfunction: " + str(np.round(np.mean(nrmse_fmean_nfold),3)) + " +/- " + str(np.round(np.std(nrmse_fmean_nfold),3)))
+    print("Median normalized RMSE: " + str(np.round(np.median(nrmedse_nfold),3)))
+    # print("Median normalized RMSE of Meanfunction: " + str(np.round(np.median(nrmedse_fmean_nfold),3)))
+    print("Mean r: " + str(np.round(np.mean(r_nfold),3)) + " +/- " + str(np.round(np.std(r_nfold),3)))
+    print("Mean r^2: " + str(np.round(np.mean(r2_nfold),3)))
+    print("Mean R^2: " + str(np.round(np.mean(R2_nfold),3)))
+    print("Mean LCCC: " + str(np.round(np.mean(lccc_nfold),3)))
+    print("Mean NSE: " + str(np.round(np.mean(nse_nfold),3)))
+    print("Mean Theta: " + str(np.round(np.mean(meansspe_nfold),3)) + " +/- " + str(np.round(np.std(meansspe_nfold),3)))
+
+    histresidual_cut = truncate_data(histresidual, 1)
+    histsspe_cut = truncate_data(histsspe, 1)
+    plt.subplot(2, 1, 1)
+    sns.distplot(histresidual_cut, norm_hist = True)
+    plt.title(settings.name_target + ' Residual Analysis of Test Data')
+    plt.ylabel('Residual')
+    plt.subplot(2, 1, 2)
+    sns.distplot(histsspe_cut, norm_hist = True)
+    plt.ylabel(r'$\Theta$')
+    #plt.title(valuename + ' SSPE Test')
+    plt.savefig(os.path.join(outpath, 'Xvalidation_Residual_hist_' + settings.name_target + '.png'), dpi=300)
+    if _show:
+        plt.show()
+    plt.close('all')
+
+    # stats_summary = (np.round(np.mean(nrmse_nfold),3), np.round(np.std(nrmse_nfold),3),  
+    # np.round(np.mean(meansspe_nfold),3), np.round(np.std(meansspe_nfold),3),  
+    # np.round(np.mean(r2_nfold),3), np.round(np.std(r2_nfold),3),
+    # np.round(np.mean(lccc_nfold),3), np.round(np.std(lccc_nfold),3),
+    # np.round(np.mean(nse_nfold),3), np.round(np.std(nse_nfold),3),
+    # np.round(np.mean(rmse_nfold),3), np.round(np.std(rmse_nfold),3),)
+    
+    stats_summary = {  'MAE'   : (np.round(np.mean(mae_nflod),3), np.round(np.std(mae_nflod),3)),
+                    'Bias'  : (np.round(np.mean(bias_nfold),3), np.round(np.std(bias_nfold),3)),
+                    'RMSE'  : (np.round(np.mean(rmse_nfold),3), np.round(np.std(rmse_nfold),3)),
+                    'ubRMSE': (np.round(np.mean(ubrmse_nfold),3), np.round(np.std(ubrmse_nfold),3)),
+                    'nRMSE': (np.round(np.mean(nrmse_nfold),3), np.round(np.std(nrmse_nfold),3)),
+                    'ubRMSE': (np.round(np.mean(ubrmse_nfold),3), np.round(np.std(ubrmse_nfold),3)),
+                    'r'     : (np.round(np.mean(r_nfold),3), np.round(np.std(r_nfold),3)), # Pearson r
+                    'r2'    : (np.round(np.mean(r2_nfold),3), np.round(np.std(r2_nfold),3)),
+                    'R2'    : (np.round(np.mean(R2_nfold),3), np.round(np.std(R2_nfold),3)),    
+                    'LCCC'  : (np.round(np.mean(lccc_nfold),3), np.round(np.std(lccc_nfold),3)),
+                    'NSE'   : (np.round(np.mean(nse_nfold),3), np.round(np.std(nse_nfold),3)),
+                    'Theta' : (np.round(np.mean(meansspe_nfold),3), np.round(np.std(meansspe_nfold),3)),
+                    }
+
+    return dfsum, stats_summary, outpath
+
+
+######################### Main Script ############################
+
+def main(fname_settings):
+    """
+    Main script for running 3D cubing with Gaussian Process.
+    See Documentation and comments below for more details.
+    """
+    # Load settings from yaml file
+    with open(fname_settings, 'r') as f:
+        settings = yaml.load(f, Loader=yaml.FullLoader)
+    # Parse settings dictinary as namespace (settings are available as 
+    # settings.variable_name rather than settings['variable_name'])
+    settings = SimpleNamespace(**settings)
+
+    # Add temporal or vertical componnet
+    if settings.axistype == 'temporal':
+        settings.colname_zcoord = settings.colname_tcoord
+        settings.colname_zmin = settings.colname_tmin
+        settings.colname_zmax =  settings.colname_tmax
+
+    if type(settings.model_functions) != list:
+        settings.model_functions = [settings.model_functions]
+
+    # check if outpath exists, if not create direcory
+    os.makedirs(settings.outpath, exist_ok = True)
+
+    # Intialise output info file:
+    print2('init')
+    print2(f'--- Parameter Settings ---')
+    print2(f'Selected Model Functions: {settings.model_functions}')
+    print2(f'Target Name: {settings.name_target}')
+    print2(f'--------------------------')
+
+    print('Reading data into dataframe...')
+    # Read in data
+    dfsel = pd.read_csv(os.path.join(settings.inpath, settings.infname))
+
+    # Rename x and y coordinates of input data
+    if settings.colname_xcoord != 'x':
+        dfsel.rename(columns={settings.colname_xcoord: 'x'}, inplace = True)
+    if settings.colname_ycoord != 'y':
+        dfsel.rename(columns={settings.colname_ycoord: 'y'}, inplace = True)
+    if (settings.axistype == 'vertical') & (settings.colname_zcoord != 'z'):
+        dfsel.rename(columns={settings.colname_zcoord: 'z'}, inplace = True)
+    else:
+        dfsel.rename(columns={settings.colname_tcoord: 'z'}, inplace = True)
+        dfsel.rename(columns={settings.colname_zcoord: 'z'}, inplace = True)
+    settings.name_features.append('z')
+ 
+    # Select data between zmin and zmax
+    dfsel = dfsel[(dfsel['z'] >= settings.colname_zmin) & (dfsel['z'] <= settings.colname_zmax)]
+
+    # Generate kfold indices
+    if settings.axistype == 'vertical':
+        dfsel = gen_kfold(dfsel, nfold = settings.nfold, label_nfold = 'nfold', id_unique = ['x','y'], precision_unique = 0.01)
+    elif settings.axistype == 'temporal':
+        #dfsel = gen_kfold(dfsel, nfold = settings.nfold, label_nfold = 'nfold', id_unique = ['x', 'y', 'z'], precision_unique = 0.01)
+        dfsel = gen_kfold(dfsel, nfold = settings.nfold, label_nfold = 'nfold', id_unique = ['x', 'y'], precision_unique = 0.01)
+
+    ## Get coordinates for training data and set coord origin to (0,0)
+    bound_xmin = dfsel.x.min()
+    bound_xmax = dfsel.x.max()
+    bound_ymin = dfsel.y.min()
+    bound_ymax = dfsel.y.max()
+
+    # Set origin to (0,0)
+    dfsel['x'] = dfsel['x'] - bound_xmin
+    dfsel['y'] = dfsel['y'] - bound_ymin
+
+    nrmse_meanfunction = []
+    nrmse_meanfunction_std = []
+    theta_meanfunction = []
+    theta_meanfunction_std = []
+    r2_meanfunction = []
+    r2_meanfunction_std = []
+    R2_meanfunction = []
+    R2_meanfunction_std = []
+
+    # Loop over model functions and evaluate
+    for model_function in settings.model_functions:
+        # run and evaluate model
+        dfsum, stats_summary, model_outpath = runmodel(dfsel, model_function, settings)
+        print(f'All output files of {model_function} saved in {model_outpath}')
+        print('')
+        # save results
+        nrmse_meanfunction.append(stats_summary['NRMSE'][0])
+        nrmse_meanfunction_std.append(stats_summary['NRMSE'][1])
+        theta_meanfunction.append(stats_summary['Theta'][0])
+        theta_meanfunction_std.append(stats_summary['Theta'][1])
+        r2_meanfunction.append(stats_summary['r2'][0])
+        r2_meanfunction_std.append(stats_summary['r2'][1])
+        R2_meanfunction.append(stats_summary['R2'][0])
+        R2_meanfunction_std.append(stats_summary['R2'][1])
+
+    #End of xval loop over all models
+    #Print best models sorted with nRMSE
+    ix_meanfunction_sorted = [nrmse_meanfunction.index(x) for x in sorted(nrmse_meanfunction)]
+    print('')
+    print('-------------------------------')
+    print('Models ranked based on nRMSE:')
+    print('')
+    for ix in ix_meanfunction_sorted:
+        print(f'{settings.model_functions[ix]}: Mean nRMSE = {nrmse_meanfunction[ix]} +/- {nrmse_meanfunction_std[ix]}, Mean r2= {r2_meanfunction[ix]} +/- {r2_meanfunction_std[ix]}, Theta = {theta_meanfunction[ix]} +/- {theta_meanfunction_std[ix]}')
+
+
+
+if __name__ == '__main__':
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Prediction model for machine learning on soil data.')
+    parser.add_argument('-s', '--settings', type=str, required=False,
+                        help='Path and filename of settings file.',
+                        default = _fname_settings)
+    args = parser.parse_args()
+
+    # Run main function
+    main(args.settings)
